@@ -15,10 +15,12 @@
 ;;
 (ns cook.test.mesos.dru
  (:use clojure.test)
- (:require [cook.mesos.dru :as dru]
+ (:require [clj-time.core :as t]
+           [clj-time.coerce :as tc]
+           [cook.mesos.dru :as dru]
            [cook.mesos.share :as share]
            [cook.mesos.util :as util]
-           [cook.test.testutil :refer (restore-fresh-database! create-dummy-job create-dummy-instance)]
+           [cook.test.testutil :refer (restore-fresh-database! create-dummy-job create-dummy-instance create-dummy-group)]
            [datomic.api :as d :refer (q db)]
            [plumbing.core :refer [map-vals]]))
 
@@ -77,21 +79,51 @@
                 "sunil" {:mem 25.0 :cpus 25.0 :gpus 1.0}}
                (dru/init-user->dru-divisors db running-task-ents pending-job-ents)))))))
 
+(deftest test-group-max-expected-runtime
+  (let [datomic-uri "datomic:mem://test-sorted-task-scored-task-pairs"
+        conn (restore-fresh-database! datomic-uri)
+        group-id (create-dummy-group conn)
+        jobs [(create-dummy-job conn :expected-runtime 100 :group group-id)
+              (create-dummy-job conn :expected-runtime 120 :group group-id)
+              (create-dummy-job conn :group group-id)]
+        create-running-job
+        (fn [conn & {:keys [expected-runtime group instance-runtime]}]
+          (let [job-id (create-dummy-job conn
+                                         :expected-runtime expected-runtime
+                                         :job-state :job.state/running
+                                         :group group)]
+            (create-dummy-instance conn job-id
+                                   :instance-status :instance.status/running
+                                   :start-time (tc/to-date (t/minus (t/now)
+                                                                    (t/millis instance-runtime)))
+                                   :end-time (tc/to-date (t/now)))))
+        ]
+    (is (= 120 (dru/group-max-expected-runtime (d/entity (d/db conn) group-id))))
+    (create-running-job conn :expected-runtime 200 :group group-id :instance-runtime 100)
+    (is (= 120 (dru/group-max-expected-runtime (d/entity (d/db conn) group-id))))
+    (create-running-job conn :expected-runtime 200 :group group-id :instance-runtime 50)
+    (is (= 150 (dru/group-max-expected-runtime (d/entity (d/db conn) group-id))))))
+
 (deftest test-sorted-task-scored-task-pairs
   (let [datomic-uri "datomic:mem://test-sorted-task-scored-task-pairs"
         conn (restore-fresh-database! datomic-uri)
+        wzhao-group (create-dummy-group conn)
+        ljin-group (create-dummy-group conn)
         jobs [(create-dummy-job conn :user "ljin" :memory 10.0 :ncpus 10.0)
               (create-dummy-job conn :user "ljin" :memory 5.0  :ncpus 5.0)
-              (create-dummy-job conn :user "ljin" :memory 15.0 :ncpus 25.0)
-              (create-dummy-job conn :user "ljin" :memory 25.0 :ncpus 15.0)
-              (create-dummy-job conn :user "wzhao" :memory 10.0 :ncpus 10.0)
+              (create-dummy-job conn :user "ljin" :memory 12.0 :ncpus 12.0
+                                :group ljin-group :expected-runtime 200)
+              (create-dummy-job conn :user "ljin" :memory 25.0 :ncpus 15.0
+                                :group ljin-group :expected-runtime 100)
+              (create-dummy-job conn :user "wzhao" :memory 10.0 :ncpus 10.0
+                                :expected-runtime 100 :group wzhao-group)
               (create-dummy-job conn :user "sunil" :memory 10.0 :ncpus 10.0)]
         tasks (doseq [job jobs]
                 (create-dummy-instance conn job :instance-status :instance.status/running))
         db (d/db conn)
         task-ents (util/get-running-task-ents db)]
     (let [share {:mem 10.0 :cpus 10.0}
-          ordered-drus [1.0 1.0 1.0 1.5 4.0 5.5]]
+          ordered-drus [0.5 1.0 1.0 1.35 1.5 5.2]]
       (testing "dru order correct"
         (is (= ordered-drus
                (map (comp :dru second)

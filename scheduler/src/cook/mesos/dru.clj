@@ -14,7 +14,9 @@
 ;; limitations under the License.
 ;;
 (ns cook.mesos.dru
-  (:require [cook.mesos.share :as share]
+  (:require [clj-time.core :as t]
+            [clj-time.coerce :as tc]
+            [cook.mesos.share :as share]
             [cook.mesos.util :as util]
             [metrics.timers :as timers]
             [swiss.arrows :refer :all]))
@@ -41,6 +43,35 @@
                 (merge-with + resources-sum resources))
               task-resources))
 
+(defn runtime-ms
+  [instance]
+  (let [start (:instance/start-time instance)
+        end (or (:instance/end-time instance)
+                (tc/to-date (t/now)))]
+    (- (.getTime end)
+       (.getTime start))))
+
+(defn group-max-expected-runtime
+  [group-ent]
+  (let [jobs (:group/job group-ent)
+        jobs-with-runtime (filter :job/expected-runtime jobs)
+        waiting? (comp (partial = :job.state/waiting) :job/state)
+        running? (comp (partial = :job.state/running) :job/state)
+        running-jobs (filter running? jobs-with-runtime)
+        running-task-fn (fn [job]
+                          (->> job
+                               :job/instance
+                               (filter #(= :instance.status/running (:instance/status %)))
+                               last))
+        running-task-runtimes (map (comp runtime-ms running-task-fn) running-jobs)
+        waiting-jobs (filter waiting? jobs-with-runtime)
+        max-waiting (apply max 0 (map :job/expected-runtime waiting-jobs))
+        max-running (->> running-jobs
+                         (map :job/expected-runtime)
+                         (map #(- %2 %1) running-task-runtimes)
+                         (apply max 0))]
+    (max max-waiting max-running)))
+
 (defn compute-task-scored-task-pairs
   "Takes a sorted seq of task entities and dru-divisors, returns a list of [task scored-task], preserving the same order of input tasks"
   [{mem-divisor :mem cpus-divisor :cpus} task-ents]
@@ -51,12 +82,42 @@
                          (accumulate-resources)
                          (map (fn [{:keys [mem cpus]}]
                                 (max (/ mem mem-divisor) (/ cpus cpus-divisor)))))
-          scored-tasks (map (fn [task dru {:keys [mem cpus]}]
-                              [task (->ScoredTask task dru mem cpus)])
+          groups (map (comp first :group/_job :job/_instance) task-ents)
+          std-correction 1.5
+          group-uuid->max-expected-runtime (->> groups
+                                                distinct
+                                                (remove nil?)
+                                                (map (juxt :group/uuid group-max-expected-runtime))
+                                                (filter #(< 0 (second %)))
+                                                (into {}))
+          ;; TODO: Should dru for each task be dru of the group? (* slowdown correction)
+          task-slowdown-correction (map (fn [task group]
+                                          (let [group-uuid (:group/uuid group)
+                                                max-expected-runtime (group-uuid->max-expected-runtime group-uuid)
+                                                job (:job/_instance task)
+                                                task-expected-runtime (:job/expected-runtime job)
+                                                ]
+                                            (cond
+                                              (not max-expected-runtime)
+                                              1
+                                              (< (* std-correction task-expected-runtime) max-expected-runtime)
+                                              ;;TODO should this be the dru of the whole group?
+                                              1
+                                              :else (/ task-expected-runtime
+                                                       (+ task-expected-runtime max-expected-runtime)))))
+                                        task-ents groups
+                                        )
+          ;; TODO Compute slowdown correction using max-expected-runtime
+          ;; TODO take a subset of tasks (5000?) and re-sort based on correction
+          scored-tasks (map (fn [task dru slowdown-correction {:keys [mem cpus]}]
+                              [task (->ScoredTask task (* slowdown-correction dru) mem cpus)])
                             task-ents
                             task-drus
+                            task-slowdown-correction
                             task-resources)]
-      scored-tasks)
+      (->> scored-tasks
+           (take 5000)
+           (sort-by (comp :dru second))))
     '()))
 
 (defn compute-sorted-task-cumulative-gpu-score-pairs
